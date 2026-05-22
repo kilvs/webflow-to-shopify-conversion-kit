@@ -1,0 +1,31 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Node / package managers
+node_modules/
+jspm_packages/
+.npm
+.pnpm-store/
+.yarn/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# AI skills (downstream conversions install their own)
+.agents/
+
+# Local-only docs that downstream conversions generate
+AUDIT.md
+
+# Misc
+.env
+.env.local
