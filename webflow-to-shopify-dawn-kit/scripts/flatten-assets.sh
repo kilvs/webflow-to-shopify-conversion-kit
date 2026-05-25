@@ -3,9 +3,11 @@
 # then rewrites Webflow CSS so ../fonts/ and ../images/ references resolve at
 # the new flat path. Reports any filename collisions before exiting.
 #
-# Phase 2 of this kit's build will extend this script to ALSO wrap Webflow CSS
-# in `@layer webflow { ... }` for cascade-layer-based conflict resolution with
-# Dawn. The wrapping step is a no-op until Phase 2 lands.
+# Finally, wraps each Webflow CSS file in `@layer webflow { ... }` so that
+# Dawn's commerce CSS (wrapped in @layer dawn by merge-dawn-commerce) and
+# Webflow's brand CSS can coexist with predictable precedence. The layer
+# order declared in theme.liquid is `@layer dawn, webflow;` — Webflow wins
+# on shared selectors.
 #
 # Usage (from project root):
 #   bash webflow-to-shopify-dawn-kit/scripts/flatten-assets.sh
@@ -60,6 +62,23 @@ for css in "$ASSETS_DIR"/*.css; do
     fixed=$((fixed + 1))
   fi
 done
+
+# Wrap Webflow CSS in @layer webflow (cascade-layer-based conflict resolution
+# with Dawn). The helper is idempotent — re-running this script is safe.
+KIT_DIR="${KIT_DIR:-webflow-to-shopify-dawn-kit}"
+WRAPPER="$KIT_DIR/scripts/wrap-css-layers.cjs"
+if [ -f "$WRAPPER" ]; then
+  if command -v node >/dev/null 2>&1; then
+    echo ""
+    echo "Wrapping Webflow CSS in @layer webflow ..."
+    node "$WRAPPER" "$ASSETS_DIR" webflow
+  else
+    echo "WARN: node not found — Webflow CSS NOT wrapped in @layer webflow." >&2
+    echo "      Dawn's CSS may override Webflow's on conflicting selectors." >&2
+  fi
+else
+  echo "WARN: $WRAPPER missing — Webflow CSS NOT wrapped in @layer webflow." >&2
+fi
 
 # Final report
 echo ""

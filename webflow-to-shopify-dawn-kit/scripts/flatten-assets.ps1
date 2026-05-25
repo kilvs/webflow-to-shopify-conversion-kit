@@ -1,8 +1,10 @@
 # PowerShell equivalent of flatten-assets.sh -- for Windows users.
 #
-# Phase 2 of this kit's build will extend this script to ALSO wrap Webflow CSS
-# in `@layer webflow { ... }` for cascade-layer-based conflict resolution with
-# Dawn. The wrapping step is a no-op until Phase 2 lands.
+# Flattens webflow-source/{css,js,images,fonts,videos,documents}/ into
+# assets/, rewrites Webflow CSS paths, and wraps each Webflow CSS file in
+# `@layer webflow { ... }` for cascade-layer-based conflict resolution with
+# Dawn. Layer order declared in theme.liquid is `@layer dawn, webflow;` --
+# Webflow wins on shared selectors.
 #
 # Usage (from project root):
 #   pwsh webflow-to-shopify-dawn-kit/scripts/flatten-assets.ps1
@@ -66,6 +68,26 @@ foreach ($css in Get-ChildItem "$AssetsDir/*.css" -File) {
         Write-Host "  rewrote ../fonts/ + ../images/ + ../videos/ + ../documents/ in $($css.Name)"
         $fixed++
     }
+}
+
+# Wrap Webflow CSS in @layer webflow (cascade-layer-based conflict resolution
+# with Dawn). The helper is idempotent -- re-running this script is safe.
+$KitDir = if ($env:KIT_DIR) { $env:KIT_DIR } else { "webflow-to-shopify-dawn-kit" }
+$Wrapper = "$KitDir/scripts/wrap-css-layers.cjs"
+if (Test-Path $Wrapper) {
+    if (Get-Command node -ErrorAction SilentlyContinue) {
+        Write-Host ""
+        Write-Host "Wrapping Webflow CSS in @layer webflow ..."
+        & node $Wrapper $AssetsDir webflow
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "wrap-css-layers.cjs returned non-zero; check output above."
+        }
+    } else {
+        Write-Warning "node not found -- Webflow CSS NOT wrapped in @layer webflow."
+        Write-Warning "Dawn's CSS may override Webflow's on conflicting selectors."
+    }
+} else {
+    Write-Warning "$Wrapper missing -- Webflow CSS NOT wrapped in @layer webflow."
 }
 
 # Report
