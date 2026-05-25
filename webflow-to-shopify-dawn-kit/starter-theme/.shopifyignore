@@ -1,0 +1,27 @@
+# Source folders -- not part of the deployed theme
+webflow-source/
+dawn-source/
+
+# Conversion kit (scripts, starter-theme, docs)
+webflow-to-shopify-dawn-kit/
+webflow-to-shopify-kit/
+
+# Conversion artifacts (informational, not part of the theme)
+AUDIT.md
+convert.cjs
+convert-forms.cjs
+split-page.cjs
+seed-template-blocks.cjs
+audit-css-conflicts.cjs
+wrap-css-layers.cjs
+
+# Project / AI context (root-only -- don't deploy)
+CLAUDE.md
+DAWN_INTEGRATION.md
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+node_modules/

@@ -1,0 +1,21 @@
+{%- comment -%}
+  Rendered once inside <head> of layout/theme.liquid (and password.liquid),
+  AFTER both Dawn (@layer dawn) and Webflow (@layer webflow) stylesheet
+  loads. Anything emitted here is "outside" both layers — so it has higher
+  precedence than ANY layered rule (per CSS cascade-layer spec).
+
+  Currently emits merchant-pasted Custom CSS. Useful for harmonizing the
+  visual seam between brand (Webflow) and commerce (Dawn) pages: paste
+  brand-color overrides, font-family unification, spacing tweaks, etc.
+
+  If you later want merchant-controlled brand colors / font scale / layout
+  toggles, add :root { --var: {{ settings.X }}; } blocks here and the
+  matching settings to config/settings_schema.json. Keep the
+  `{% if settings.X != blank %}` guard so empty settings never override
+  the design's defaults.
+{%- endcomment -%}
+{%- if settings.custom_css != blank -%}
+<style id="theme-custom-css">
+{{ settings.custom_css }}
+</style>
+{%- endif -%}
