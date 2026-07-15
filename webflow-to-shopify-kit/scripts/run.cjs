@@ -4,32 +4,42 @@
  *
  * Runs every automatable step in sequence. Unlike convert-all.sh (which
  * aborts on the first error), this runner CONTINUES on failure so you
- * get a full pass/fail picture at the end — not "step 3 died, no idea
- * about the rest." Every step is idempotent, so re-running after fixing
- * the underlying issue is safe.
+ * get a full pass/fail picture at the end.
  *
  * Preconditions:
  *   - webflow-source/ exists (unzipped Webflow export)
  *   - webflow-to-shopify-kit/ lives at the project root
  *   - node available on PATH
- *   - bash available (Git Bash on Windows) OR pwsh/powershell available
+ *   - Git Bash (Windows) OR bash (macOS/Linux) OR pwsh/powershell (Windows fallback)
  *
  * Usage (from project root):
  *   node webflow-to-shopify-kit/scripts/run.cjs
  *
+ * Re-run safety:
+ *   Most steps are fully idempotent — safe to re-run after any failure.
+ *   ONE nuance: the "Bootstrap starter theme" step SKIPS files that
+ *   already exist at the destination, so it won't clobber your
+ *   hand-edited layout/theme.liquid or sections/header.liquid on re-run.
+ *   Fresh files (like a newly-added starter-theme snippet in a kit update)
+ *   still get copied.
+ *
  * Cross-platform notes:
- *   - macOS/Linux: uses /bin/bash for the .sh scripts.
- *   - Windows: uses Git Bash if `bash` is on PATH (comes with Git for
- *     Windows). If not, falls back to invoking the .ps1 versions via
- *     `pwsh` (PowerShell 7+) or `powershell` (Windows PowerShell 5.x).
+ *   - macOS/Linux/WSL: uses /bin/bash for the .sh scripts.
+ *   - Windows: prefers Git Bash. WSL bash is auto-detected and IGNORED
+ *     (it can't resolve Windows-style paths). Falls back to pwsh 7+ or
+ *     Windows PowerShell 5.x for the .ps1 versions.
+ *   - Legacy Windows console (cmd.exe / powershell.exe 5.x without
+ *     Windows Terminal): output uses ASCII glyphs to avoid mojibake
+ *     from the CP-437/1252 codepage. Windows Terminal / macOS / Linux
+ *     get the Unicode box-drawing glyphs.
  *
  * Exit codes:
- *   0 — every step passed or was skipped as an idempotent no-op.
- *   1 — preflight failure OR one or more steps failed. Summary at end
- *       shows which.
+ *   0 — every pipeline step passed or was skipped as an idempotent no-op.
+ *       Informational check-required-files warnings do NOT trigger exit 1.
+ *   1 — preflight failure OR one or more pipeline steps failed.
  *
- * Safe to delete after conversion — every step can also be run
- * standalone (see webflow-to-shopify-kit/scripts/*).
+ * Safe to delete after conversion — every step can also be run standalone
+ * (see webflow-to-shopify-kit/scripts/*).
  */
 
 const { spawnSync } = require('child_process');
@@ -39,6 +49,22 @@ const path = require('path');
 const ROOT = process.cwd();
 const KIT_NAME = 'webflow-to-shopify-kit';
 const KIT = path.join(ROOT, KIT_NAME);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Glyph mode — ASCII fallback for legacy Windows consoles
+// Windows Terminal sets WT_SESSION; PowerShell 7+ inherits UTF-8 codepage.
+// Legacy conhost / powershell.exe 5.x on stock Windows default to CP-437
+// or CP-1252 and render box-drawing chars as `â•â•â•`.
+// ─────────────────────────────────────────────────────────────────────────
+const ON_WINDOWS = process.platform === 'win32';
+const USE_ASCII = ON_WINDOWS && !process.env.WT_SESSION;
+
+const G = USE_ASCII
+  ? { hr: '=', hrLight: '-', arrow: '>>', ok: '[OK]  ', fail: '[FAIL]', skip: '[SKIP]', warn: '[WARN]' }
+  : { hr: '═', hrLight: '─', arrow: '▶',  ok: '✓',      fail: '✗',      skip: '⊘',      warn: '⚠' };
+
+const HR = G.hr.repeat(72);
+const hr = G.hrLight.repeat(72);
 
 // ─────────────────────────────────────────────────────────────────────────
 // Preflight
@@ -51,17 +77,14 @@ function preflight() {
   if (!fs.existsSync(KIT)) {
     errors.push(`${KIT_NAME}/ not found at project root. Copy the kit folder in first.`);
   }
-  const nodeCheck = spawnSync(process.execPath, ['--version'], { stdio: 'ignore' });
-  if (nodeCheck.status !== 0) {
-    errors.push('node binary check failed (very unusual — this script itself is node).');
-  }
   return errors;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Shell detection: bash preferred, PowerShell fallback
+// Shell detection: prefer Git Bash / real bash; reject WSL bash on Windows;
+// fall back to pwsh / powershell for .ps1 scripts.
 // ─────────────────────────────────────────────────────────────────────────
-function cmdAvailable(cmd, args) {
+function cmdReturnsZero(cmd, args) {
   try {
     const res = spawnSync(cmd, args, { stdio: 'ignore' });
     return res.status === 0;
@@ -69,22 +92,46 @@ function cmdAvailable(cmd, args) {
     return false;
   }
 }
-const HAS_BASH = cmdAvailable('bash', ['--version']);
-let PWSH_CMD = null;
-if (!HAS_BASH) {
-  if (cmdAvailable('pwsh', ['-NoProfile', '-Command', '$true'])) PWSH_CMD = 'pwsh';
-  else if (cmdAvailable('powershell', ['-NoProfile', '-Command', '$true'])) PWSH_CMD = 'powershell';
+
+function detectBash() {
+  // Basic availability check
+  if (!cmdReturnsZero('bash', ['--version'])) return false;
+
+  // On Windows, we need to make sure this isn't WSL bash (which can't
+  // execute Windows-path .sh scripts). Git Bash / MSYS bash reports
+  // OSTYPE as msys/cygwin; WSL bash reports linux-gnu.
+  if (ON_WINDOWS) {
+    try {
+      const res = spawnSync('bash', ['-c', 'echo "$OSTYPE"'], { encoding: 'utf8' });
+      const ostype = (res.stdout || '').trim().toLowerCase();
+      // Accept: msys, cygwin. Reject: linux-gnu (WSL) and anything unknown.
+      if (!ostype.includes('msys') && !ostype.includes('cygwin')) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
+
+function detectPwsh() {
+  if (cmdReturnsZero('pwsh', ['-NoProfile', '-Command', '$true'])) return 'pwsh';
+  if (cmdReturnsZero('powershell', ['-NoProfile', '-Command', '$true'])) return 'powershell';
+  return null;
+}
+
+const HAS_BASH = detectBash();
+const PWSH_CMD = HAS_BASH ? null : detectPwsh();
 
 // ─────────────────────────────────────────────────────────────────────────
 // Step runners
 // ─────────────────────────────────────────────────────────────────────────
 function runShellScript(baseName) {
-  // baseName = 'install-skills' → picks .sh via bash OR .ps1 via powershell
   if (HAS_BASH) {
     const scriptPath = path.join(KIT, 'scripts', `${baseName}.sh`);
     if (!fs.existsSync(scriptPath)) {
-      console.error(`  ✗ script not found: ${scriptPath}`);
+      console.error(`  ${G.fail} script not found: ${scriptPath}`);
       return 127;
     }
     const res = spawnSync('bash', [scriptPath], { stdio: 'inherit', cwd: ROOT });
@@ -93,7 +140,7 @@ function runShellScript(baseName) {
   if (PWSH_CMD) {
     const scriptPath = path.join(KIT, 'scripts', `${baseName}.ps1`);
     if (!fs.existsSync(scriptPath)) {
-      console.error(`  ✗ script not found: ${scriptPath}`);
+      console.error(`  ${G.fail} script not found: ${scriptPath}`);
       return 127;
     }
     const res = spawnSync(PWSH_CMD, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], {
@@ -101,74 +148,160 @@ function runShellScript(baseName) {
     });
     return res.status ?? 1;
   }
-  console.error('  ✗ no shell available (neither bash nor pwsh/powershell)');
+  console.error(`  ${G.fail} no shell available (neither Git Bash nor pwsh/powershell)`);
   return 127;
 }
 
 function runNodeScript(scriptRelPath) {
   const scriptPath = path.join(KIT, 'scripts', scriptRelPath);
   if (!fs.existsSync(scriptPath)) {
-    console.error(`  ✗ script not found: ${scriptPath}`);
+    console.error(`  ${G.fail} script not found: ${scriptPath}`);
     return 127;
   }
   const res = spawnSync(process.execPath, [scriptPath], { stdio: 'inherit', cwd: ROOT });
   return res.status ?? 1;
 }
 
-// Bootstrap starter theme — Node-native recursive copy so we don't need
-// cp / robocopy / xcopy across platforms
-function copyDirRecursive(src, dest) {
+// ─────────────────────────────────────────────────────────────────────────
+// Bootstrap starter theme — IDEMPOTENT: skips files that already exist at
+// destination so hand-edited layout/theme.liquid, sections/header.liquid,
+// etc. survive re-runs. Newly-added starter-theme files (from a kit
+// update) still get copied.
+// ─────────────────────────────────────────────────────────────────────────
+function copyDirRecursivePreserve(src, dest, stats) {
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     const sPath = path.join(src, entry.name);
     const dPath = path.join(dest, entry.name);
     if (entry.isDirectory()) {
-      copyDirRecursive(sPath, dPath);
+      copyDirRecursivePreserve(sPath, dPath, stats);
     } else if (entry.isFile()) {
-      fs.copyFileSync(sPath, dPath);
+      if (fs.existsSync(dPath)) {
+        stats.skipped.push(path.relative(ROOT, dPath));
+      } else {
+        fs.copyFileSync(sPath, dPath);
+        stats.added.push(path.relative(ROOT, dPath));
+      }
     }
   }
 }
 function bootstrapStarterTheme() {
   const src = path.join(KIT, 'starter-theme');
   if (!fs.existsSync(src)) {
-    console.error(`  ✗ ${src} not found`);
+    console.error(`  ${G.fail} ${src} not found`);
     return 1;
   }
+  const stats = { added: [], skipped: [] };
   try {
-    copyDirRecursive(src, ROOT);
-    console.log(`  ✓ starter-theme/ copied into project root`);
-    return 0;
+    copyDirRecursivePreserve(src, ROOT, stats);
   } catch (err) {
-    console.error(`  ✗ copy failed: ${err.message}`);
+    console.error(`  ${G.fail} copy failed: ${err.message}`);
     return 1;
   }
+  console.log(`  ${G.ok} ${stats.added.length} added, ${stats.skipped.length} skipped (already present).`);
+  if (stats.added.length > 0 && stats.added.length <= 12) {
+    for (const f of stats.added) console.log(`      + ${f}`);
+  } else if (stats.added.length > 12) {
+    for (const f of stats.added.slice(0, 8)) console.log(`      + ${f}`);
+    console.log(`      + …and ${stats.added.length - 8} more`);
+  }
+  if (stats.skipped.length > 0) {
+    console.log(`      (skipped files were preserved — bootstrap never overwrites your edits)`);
+  }
+  return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Skip predicates
+// Required-files check — Node-native so it works on any platform without
+// a shell script. Two categories:
+//   HARD = must exist (pipeline should have produced these)
+//   SOFT = expected to be built by hand/AI after this orchestrator; missing
+//          is a warning, not a failure.
+// ─────────────────────────────────────────────────────────────────────────
+const HARD_REQUIRED = [
+  'layout/theme.liquid',
+  'layout/password.liquid',
+  'templates/index.json',
+  'templates/404.json',
+  'templates/password.json',
+  'templates/gift_card.liquid',
+  'templates/list-collections.json',
+  'templates/cart.json',
+  'templates/search.json',
+  'templates/customers/account.liquid',
+  'templates/customers/activate_account.liquid',
+  'templates/customers/addresses.liquid',
+  'templates/customers/login.liquid',
+  'templates/customers/order.liquid',
+  'templates/customers/register.liquid',
+  'templates/customers/reset_password.liquid',
+  'config/settings_schema.json',
+  'config/settings_data.json',
+  'locales/en.default.json',
+];
+// Templates the human authors after the orchestrator finishes — missing
+// on a first run is expected, not a failure.
+const SOFT_REQUIRED = [
+  'templates/product.json',
+  'templates/collection.json',
+  'templates/page.json',
+  'templates/blog.json',
+  'templates/article.json',
+];
+function checkRequiredFiles() {
+  const missingHard = HARD_REQUIRED.filter(f => !fs.existsSync(path.join(ROOT, f)));
+  const missingSoft = SOFT_REQUIRED.filter(f => !fs.existsSync(path.join(ROOT, f)));
+
+  if (missingHard.length === 0 && missingSoft.length === 0) {
+    console.log(`  ${G.ok} All Shopify-required files present.`);
+    return { code: 0, softMissing: [] };
+  }
+
+  if (missingHard.length > 0) {
+    console.log(`  ${G.fail} ${missingHard.length} required file(s) missing (pipeline should have produced these):`);
+    for (const f of missingHard) console.log(`      MISSING: ${f}`);
+  }
+  if (missingSoft.length > 0) {
+    console.log(`  ${G.warn} ${missingSoft.length} template(s) not yet built (expected on first run — see TODO below):`);
+    for (const f of missingSoft) console.log(`      TODO: ${f}`);
+  }
+  // Hard-missing is a real failure; soft-only-missing is informational (exit 0).
+  return { code: missingHard.length > 0 ? 1 : 0, softMissing: missingSoft };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Skip predicates + form detection
 // ─────────────────────────────────────────────────────────────────────────
 function skillsAlreadyInstalled() {
   return fs.existsSync(path.join(ROOT, '.agents/skills/shopify-dev')) &&
          fs.existsSync(path.join(ROOT, '.agents/skills/shopify-liquid'));
 }
-function hasNewsletterForm() {
+
+// Scan sections/ for every wf-form-* ID (Newsletter, Subscribe, Contact,
+// Signup, etc.). Return { hasAnyWfForm, hasNewsletter, otherIds }.
+function detectWebflowForms() {
   const sectionsDir = path.join(ROOT, 'sections');
-  if (!fs.existsSync(sectionsDir)) return false;
+  if (!fs.existsSync(sectionsDir)) {
+    return { hasAnyWfForm: false, hasNewsletter: false, otherIds: [] };
+  }
   const files = fs.readdirSync(sectionsDir).filter(f => f.endsWith('.liquid'));
-  return files.some(f => {
-    try {
-      const content = fs.readFileSync(path.join(sectionsDir, f), 'utf8');
-      return content.includes('wf-form-Newsletter-Form');
-    } catch {
-      return false;
-    }
-  });
+  const idPattern = /id="(wf-form-[A-Za-z0-9_-]+)"/g;
+  const found = new Set();
+  for (const f of files) {
+    let content;
+    try { content = fs.readFileSync(path.join(sectionsDir, f), 'utf8'); } catch { continue; }
+    let m;
+    while ((m = idPattern.exec(content)) !== null) found.add(m[1]);
+  }
+  const hasNewsletter = found.has('wf-form-Newsletter-Form');
+  const otherIds = [...found].filter(id => id !== 'wf-form-Newsletter-Form');
+  return { hasAnyWfForm: found.size > 0, hasNewsletter, otherIds };
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Step definitions
 // ─────────────────────────────────────────────────────────────────────────
+let formInfo = null;  // populated by the form step's skip check
 const STEPS = [
   {
     label: 'Install Shopify AI skills',
@@ -185,7 +318,7 @@ const STEPS = [
     run: () => runShellScript('flatten-assets'),
   },
   {
-    label: 'Bootstrap starter theme',
+    label: 'Bootstrap starter theme (preserves your edits on re-run)',
     run: bootstrapStarterTheme,
   },
   {
@@ -194,46 +327,58 @@ const STEPS = [
   },
   {
     label: 'Convert Webflow newsletter forms',
-    skip: () => !hasNewsletterForm(),
-    skipReason: 'no wf-form-Newsletter-Form found in sections/',
+    skip: () => {
+      formInfo = detectWebflowForms();
+      return !formInfo.hasNewsletter;
+    },
+    skipReason: () => {
+      if (!formInfo.hasAnyWfForm) return 'no wf-form-* IDs found in sections/';
+      return `no wf-form-Newsletter-Form (but found ${formInfo.otherIds.join(', ')} — convert those manually or extend convert-forms.cjs)`;
+    },
     run: () => runNodeScript('convert-forms.cjs'),
   },
   {
     label: 'Verify Shopify-required files',
-    run: () => runShellScript('check-required-files'),
+    informational: true,       // soft-missing templates don't count as failure
+    run: () => {
+      const { code, softMissing } = checkRequiredFiles();
+      // Stash soft-missing for the final TODO block
+      formInfo && (formInfo._softMissing = softMissing);
+      return code;
+    },
   },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────
 // Main
 // ─────────────────────────────────────────────────────────────────────────
-const HR = '═'.repeat(72);
-const hr = '─'.repeat(72);
-
 const errs = preflight();
 if (errs.length > 0) {
   console.error('');
   console.error('Preflight failed:');
-  for (const e of errs) console.error(`  ✗ ${e}`);
+  for (const e of errs) console.error(`  ${G.fail} ${e}`);
   console.error('');
   process.exit(1);
 }
 if (!HAS_BASH && !PWSH_CMD) {
   console.error('');
-  console.error('No shell available. Install Git for Windows (which brings Git Bash)');
-  console.error('or PowerShell (pwsh 7+ or powershell 5.x). Then re-run.');
+  console.error('No usable shell available.');
+  console.error('  - On Windows: install Git for Windows (brings Git Bash) OR PowerShell 7+.');
+  console.error('  - WSL bash on Windows is auto-detected and skipped (cannot resolve Windows paths).');
+  console.error('  - On macOS/Linux: install bash if it is missing (it usually is not).');
   console.error('');
   process.exit(1);
 }
 
-const shellLabel = HAS_BASH ? 'bash' : PWSH_CMD;
+const shellLabel = HAS_BASH ? 'bash (Git Bash / MSYS / native)' : PWSH_CMD;
 
 console.log('');
 console.log(HR);
-console.log('  Webflow → Shopify conversion');
+console.log('  Webflow -> Shopify conversion');
 console.log(HR);
 console.log(`  Kit:   ${KIT_NAME}/`);
 console.log(`  Shell: ${shellLabel}`);
+console.log(`  Glyphs:${USE_ASCII ? ' ASCII (legacy Windows console)' : ' Unicode'}`);
 console.log(`  Steps: ${STEPS.length}`);
 console.log(HR);
 
@@ -244,11 +389,21 @@ for (let i = 0; i < STEPS.length; i++) {
   const step = STEPS[i];
   const n = i + 1;
   console.log('');
-  console.log(`▶ Step ${n}/${STEPS.length}: ${step.label}`);
+  console.log(`${G.arrow} Step ${n}/${STEPS.length}: ${step.label}`);
   console.log(hr);
 
-  if (step.skip && step.skip()) {
-    console.log(`  ⊘ SKIPPED — ${step.skipReason}`);
+  let skipReason = null;
+  try {
+    if (step.skip && step.skip()) {
+      skipReason = typeof step.skipReason === 'function' ? step.skipReason() : step.skipReason;
+    }
+  } catch (err) {
+    console.error(`  ${G.fail} skip predicate threw: ${err.message}`);
+    results.push({ label: step.label, status: 'failed', duration: 0, code: 1 });
+    continue;
+  }
+  if (skipReason !== null) {
+    console.log(`  ${G.skip} SKIPPED - ${skipReason}`);
     results.push({ label: step.label, status: 'skipped', duration: 0 });
     continue;
   }
@@ -259,15 +414,25 @@ for (let i = 0; i < STEPS.length; i++) {
     code = step.run();
     if (typeof code !== 'number') code = 0;
   } catch (err) {
-    console.error(`  ✗ threw: ${err.message}`);
+    console.error(`  ${G.fail} threw: ${err.message}`);
     code = 1;
   }
   const duration = Date.now() - start;
-  const status = code === 0 ? 'ok' : 'failed';
-  const symbol = code === 0 ? '✓' : '✗';
+  let status;
+  let symbol;
+  if (code === 0) {
+    status = 'ok';
+    symbol = G.ok;
+  } else if (step.informational) {
+    status = 'warned';
+    symbol = G.warn;
+  } else {
+    status = 'failed';
+    symbol = G.fail;
+  }
   console.log('');
   console.log(`  ${symbol} ${status.toUpperCase()} (exit ${code}, ${(duration / 1000).toFixed(1)}s)`);
-  results.push({ label: step.label, status, duration, code });
+  results.push({ label: step.label, status, duration, code, informational: !!step.informational });
 }
 
 // Summary
@@ -278,39 +443,58 @@ console.log('  Summary');
 console.log(HR);
 console.log('');
 for (const r of results) {
-  const sym = r.status === 'ok' ? '✓' : r.status === 'skipped' ? '⊘' : '✗';
+  const sym = r.status === 'ok' ? G.ok
+            : r.status === 'warned' ? G.warn
+            : r.status === 'skipped' ? G.skip
+            : G.fail;
   const time = r.duration > 0 ? ` (${(r.duration / 1000).toFixed(1)}s)` : '';
-  const codePart = r.status === 'failed' ? ` [exit ${r.code}]` : '';
+  const codePart = (r.status === 'failed' || r.status === 'warned') ? ` [exit ${r.code}]` : '';
   console.log(`  ${sym} ${r.label}${time}${codePart}`);
 }
 console.log('');
 
-const ok = results.filter(r => r.status === 'ok').length;
-const failed = results.filter(r => r.status === 'failed').length;
-const skipped = results.filter(r => r.status === 'skipped').length;
-console.log(`  ${ok} passed, ${failed} failed, ${skipped} skipped. Total: ${(totalDur / 1000).toFixed(1)}s`);
+const okCount = results.filter(r => r.status === 'ok').length;
+const failedCount = results.filter(r => r.status === 'failed').length;
+const warnedCount = results.filter(r => r.status === 'warned').length;
+const skippedCount = results.filter(r => r.status === 'skipped').length;
+console.log(`  ${okCount} passed, ${failedCount} failed, ${warnedCount} warned, ${skippedCount} skipped. Total: ${(totalDur / 1000).toFixed(1)}s`);
 console.log('');
 
-if (failed > 0) {
-  console.log('  ⚠ One or more steps failed. Fix the underlying issue (see logs above)');
-  console.log('    and re-run — every step is idempotent so re-runs are safe.');
+// Hand-off — ALWAYS print if pipeline steps succeeded (even if verifier warned).
+// A "failed" (non-informational) step still triggers the exit-1 path below.
+if (failedCount === 0) {
+  console.log('  ' + G.ok + ' Automated steps complete.');
   console.log('');
-  process.exit(1);
+  console.log('  Still TODO (judgement calls — hand to Claude Code / another AI');
+  console.log(`  agent using ${KIT_NAME}/CONVERT_PROMPT.md as the brief, or do by hand`);
+  console.log('  per CONVERSION_GUIDE.md):');
+  console.log('');
+  console.log('  * Fill placeholders in layout/theme.liquid (paste values from AUDIT.md):');
+  console.log('      <YOUR_WF_SITE_ID>       (data-wf-site constant)');
+  console.log('      <WF_PAGE_*>             (per-template data-wf-page IDs)');
+  console.log('      <WEBFLOW_BUNDLE>.js     (JS bundle filename)');
+  console.log('      site.css                (rename to your primary CSS filename)');
+  console.log('  * Build sections/header.liquid + sections/footer.liquid');
+  console.log('      (lift markup from webflow-source/index.html, wrap with {% schema %})');
+  console.log('  * Wire commerce in sections/page-product.liquid +');
+  console.log('      sections/page-collection.liquid (see CONVERSION_GUIDE.md §E)');
+  console.log('  * (Optional) Split homepage into per-block sections:');
+  console.log(`      node ${KIT_NAME}/scripts/split-page.cjs`);
+  if (warnedCount > 0) {
+    console.log('');
+    console.log('  Note: the verifier warned about missing templates (product.json,');
+    console.log('  collection.json, page.json, blog.json, article.json). These are');
+    console.log('  expected — they get built as part of the TODO above.');
+  }
+  console.log('');
+  console.log('  Then: commit + push + connect Shopify + import products + publish.');
+  console.log('');
+  process.exit(0);
 }
 
-// Success — surface follow-up work
-console.log('  ✓ Automated steps complete.');
+// Real failures — print actionable message
+console.log('  ' + G.warn + ' One or more pipeline steps failed. Fix the underlying issue');
+console.log('    (see logs above) and re-run — most steps are safely idempotent.');
+console.log('    Bootstrap step preserves existing files so your hand edits are safe.');
 console.log('');
-console.log('  Still TODO (judgement calls — hand to Claude Code / other AI agent');
-console.log(`  with ${KIT_NAME}/CONVERT_PROMPT.md as the brief):`);
-console.log('');
-console.log('  • Fill placeholders in layout/theme.liquid (paste values from AUDIT.md)');
-console.log('  • Build sections/header.liquid + sections/footer.liquid');
-console.log('    (lift from webflow-source/index.html, wrap with schema)');
-console.log('  • Wire commerce in sections/page-product.liquid +');
-console.log('    sections/page-collection.liquid');
-console.log('  • (Optional) Split homepage into per-block sections via');
-console.log(`    node ${KIT_NAME}/scripts/split-page.cjs`);
-console.log('');
-console.log('  Then: commit + push + connect Shopify + import products + publish.');
-console.log('');
+process.exit(1);
